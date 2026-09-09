@@ -1,0 +1,8 @@
+*.txt
+*.tar
+activitynet13
+dcase
+desed
+*.log
+*.ipynb
+*.ipynb_checkpoints
