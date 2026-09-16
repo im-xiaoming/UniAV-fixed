@@ -1,7 +1,7 @@
 import logging
 from tensorboardX import SummaryWriter
 from functools import partial, wraps
-from torch._six import inf
+from math import inf  # torch._six was removed in PyTorch >= 1.13
 import torch.distributed as dist
 from torch.utils.data import RandomSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -52,7 +52,7 @@ def LoadDatasetsTrain(args, cfg, task_cfg, ids, generator):
                                         worker_init_fn=worker_init_reset_seed, 
                                         drop_last=True,
                                         generator=generator,
-                                        persistent_workers=True
+                                        persistent_workers=(num_workers > 0)
                                         )
         task_num_iters[task] = len(task_dataloader_train[task])
         task_batch_size[task] = batch_size
@@ -94,7 +94,7 @@ def LoadDatasetsVal(args, cfg, task_cfg, ids, split):
                                         collate_fn=trivial_batch_collator,
                                         shuffle=False, 
                                         drop_last=False,
-                                        persistent_workers=True
+                                        persistent_workers=(num_workers > 0)
                                         )
         task_val_db_vars[task] = task_datasets_val[task].get_attributes()
         task_det_eval[task] = ANETdetection(
@@ -118,7 +118,7 @@ def ForwardModelsTrain(
 
     task_count[task_id] += 1
     # get the batch
-    batch = task_iter_train[task_id].next()
+    batch = next(task_iter_train[task_id])  # .next() was removed in newer PyTorch
 
     losses = model(batch, task_id, task_cfg[task_id]['task_type'])
 

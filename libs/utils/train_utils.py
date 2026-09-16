@@ -80,15 +80,20 @@ def make_optimizer(model, optimizer_config, base_lr):
     blacklist_weight_modules = (LayerNorm, torch.nn.GroupNorm)
 
     clip_params = set() 
+    # the original code assumes the model is always wrapped in DistributedDataParallel,
+    # i.e. every parameter name is prefixed with "module.". Detect the prefix instead so
+    # that a plain (non-DDP) nn.Module works as well.
+    prefix = 'module.' if any(
+        n.startswith('module.') for n, _ in model.named_parameters()) else ''
     # loop over all modules / params
     for mn, m in model.named_modules():
         for pn, p in m.named_parameters():
             fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
-            if pn.startswith('module.cls_head.clip_proj'):
+            if pn.startswith(prefix + 'cls_head.clip_proj'):
                 clip_params.add(fpn)
-            if pn.startswith('module.CLIP'):
+            if pn.startswith(prefix + 'CLIP'):
                 clip_params.add(fpn)
-            if pn.startswith('module.reg_head.clip_proj'):
+            if pn.startswith(prefix + 'reg_head.clip_proj'):
                 clip_params.add(fpn)
             if pn.endswith('bias'):
                  # all biases will not be decayed
@@ -105,14 +110,14 @@ def make_optimizer(model, optimizer_config, base_lr):
             elif pn.endswith('logit_scale'):
                 no_decay.add(fpn)
  
-    no_decay.remove('module.cls_head.clip_proj.bias')
-    decay.remove('module.cls_head.clip_proj.weight')
+    no_decay.remove(prefix + 'cls_head.clip_proj.bias')
+    decay.remove(prefix + 'cls_head.clip_proj.weight')
 
     for p1 in no_decay.copy():
-        if p1.startswith('module.CLIP'):
+        if p1.startswith(prefix + 'CLIP'):
             no_decay.remove(p1)
     for p2 in decay.copy():
-        if p2.startswith('module.CLIP'):
+        if p2.startswith(prefix + 'CLIP'):
             decay.remove(p2)       
 
     # validate that we considered every parameter

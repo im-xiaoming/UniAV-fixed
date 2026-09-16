@@ -37,7 +37,7 @@ def make_data_loader(dataset, is_training, generator, batch_size, num_workers, s
         worker_init_fn=(worker_init_reset_seed if is_training else None),
         drop_last=is_training,
         generator=generator,
-        persistent_workers=True
+        persistent_workers=(num_workers > 0)
     )
     return loader
 

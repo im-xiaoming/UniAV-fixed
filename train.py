@@ -23,11 +23,44 @@ from libs.utils import (LoadDatasetsTrain, LoadDatasetsVal,
                         fix_random_seed, ModelEma)
 import libs.utils.task_utils as utils
 
+
+def load_prompt(*candidates):
+    """Load pre-extracted ONE-PEACE text embeddings, accepting either folder layout."""
+    for path in candidates:
+        if os.path.isfile(path):
+            return np.load(path)
+    raise FileNotFoundError(
+        "none of these prompt files exist: {}".format(", ".join(candidates)))
+
+
+def match_ckpt_prefix(state_dict, model):
+    """Add / strip the DistributedDataParallel "module." prefix so that a checkpoint
+    saved with torchrun also resumes under plain `python train.py` (and vice versa)."""
+    model_ddp = next(iter(model.state_dict())).startswith('module.')
+    ckpt_ddp = next(iter(state_dict)).startswith('module.')
+    if model_ddp == ckpt_ddp:
+        return state_dict
+    if ckpt_ddp:
+        return {k[len('module.'):]: v for k, v in state_dict.items()}
+    return {'module.' + k: v for k, v in state_dict.items()}
+
+
+def torch_load(path, map_location):
+    """torch.load that works both before and after the weights_only default flip."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:  # PyTorch < 1.13 has no weights_only argument
+        return torch.load(path, map_location=map_location)
+
 def main(args):
     """main function that handles training / inference"""
 
     """1. setup parameters / folders"""
     args.start_epoch = 0
+    # torchrun (PyTorch >= 2.0) passes the local rank via the LOCAL_RANK env var
+    # instead of the --local_rank flag used by the old torch.distributed.launch
+    if args.local_rank == -1 and "LOCAL_RANK" in os.environ:
+        args.local_rank = int(os.environ["LOCAL_RANK"])
     if os.path.isfile(args.config):
         cfg, task_cfg = load_config(args.config)
     else:
@@ -44,7 +77,7 @@ def main(args):
         n_gpu = 1
         torch.distributed.init_process_group(backend="nccl")
     
-    rank = dist.get_rank()
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     logger = logging.getLogger(f'LOG')
     logger.propagate = False
     logger.setLevel(logging.INFO)
@@ -65,9 +98,15 @@ def main(args):
     else:
         default_gpu = True
 
+    # command line overrides, handy on machines with little RAM / VRAM (e.g. Colab)
+    if args.num_workers >= 0:
+        cfg['num_workers'] = args.num_workers
+    if args.batch_size > 0:
+        for task in task_cfg:
+            task_cfg[task]['batch_size'] = args.batch_size
+
     # prep for output folder (based on time stamp)
-    if not os.path.exists(cfg['output_folder']):
-        os.mkdir(cfg['output_folder'])
+    os.makedirs(cfg['output_folder'], exist_ok=True)
     cfg_filename = os.path.basename(args.config).replace('.yaml', '')
     if len(args.output) == 0:
         ts = datetime.datetime.fromtimestamp(int(time.time()))
@@ -76,8 +115,7 @@ def main(args):
     else:
         ckpt_folder = os.path.join(
             cfg['output_folder'], cfg_filename + '_' + str(args.output))
-    if not os.path.exists(ckpt_folder):
-        os.mkdir(ckpt_folder)
+    os.makedirs(ckpt_folder, exist_ok=True)
 
     # fix the random seeds (this will fix everything)
     if default_gpu:
@@ -111,9 +149,11 @@ def main(args):
             threshold=0.001,)  
     
     # load text embeddings pre-extracted from ONE-PEACE text encoder for each dataset
-    class_feature_anet = np.load('./data/activitynet13/anet_prompt.npy') 
-    class_feature_unav = np.load('./data/unav100/unav100_prompt.npy')
-    class_feature_dcase = np.load('./data/dcase/dcase_prompt.npy')
+    class_feature_anet = load_prompt('./data/activitynet13/anet_prompt.npy')
+    class_feature_unav = load_prompt('./data/unav100/unav100_prompt.npy')
+    # the DESED prompt file ships under ./data/desed (the config also uses ./data/desed)
+    class_feature_dcase = load_prompt(
+        './data/desed/dcase_prompt.npy', './data/dcase/dcase_prompt.npy')
     task_cfg['TASK1']['clip_class_feature'] = torch.tensor(class_feature_anet, dtype=torch.float32).to(device)
     task_cfg['TASK2']['clip_class_feature'] = torch.tensor(class_feature_unav, dtype=torch.float32).to(device)
     task_cfg['TASK3']['clip_class_feature'] = torch.tensor(class_feature_dcase, dtype=torch.float32).to(device)
@@ -162,12 +202,12 @@ def main(args):
     if args.resume:
         if os.path.isfile(args.resume):
             # load ckpt, reset epoch / best rmse
-            checkpoint = torch.load(args.resume,
-                map_location = lambda storage, loc: storage.cuda(
-                    cfg['devices'][0]))
+            checkpoint = torch_load(args.resume, map_location=device)
             args.start_epoch = checkpoint['epoch'] + 1
-            model.load_state_dict(checkpoint['state_dict'])
-            model_ema.module.load_state_dict(checkpoint['state_dict_ema'])
+            model.load_state_dict(
+                match_ckpt_prefix(checkpoint['state_dict'], model))
+            model_ema.module.load_state_dict(
+                match_ckpt_prefix(checkpoint['state_dict_ema'], model_ema.module))
             # also load the optimizer / scheduler if necessary
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint['scheduler'])
@@ -235,16 +275,26 @@ def main(args):
                     logger.info("evluation done! Total time: {:0.2f} sec".format(end - start))
                 
                 if default_gpu:
-                    for task_id in task_ids:
-                        if avg_mAP[task_id] > best_mAP[task_id]:
-                            best_mAP[task_id] = avg_mAP[task_id]
-                            save_states = {
+                    # the original code assembled `save_states` here but never wrote it
+                    # to disk, and raised UnboundLocalError when no task improved
+                    improved = [t for t in task_ids if avg_mAP[t] > best_mAP[t]]
+                    for task_id in improved:
+                        best_mAP[task_id] = avg_mAP[task_id]
+                    if improved:
+                        save_checkpoint(
+                            {
                                 'epoch': epoch,
                                 'state_dict': model.state_dict(),
                                 'scheduler': scheduler.state_dict(),
                                 'optimizer': optimizer.state_dict(),
-                            }
-                        save_states['state_dict_ema'] = model_ema.module.state_dict()
+                                'state_dict_ema': model_ema.module.state_dict(),
+                            },
+                            None, False,
+                            file_folder=ckpt_folder,
+                            file_name='best.pth.tar'
+                        )
+                        logger.info("saved best.pth.tar (improved: {:s})".format(
+                            ', '.join(improved)))
                 
         if default_gpu:
             # save ckpt once in a while
@@ -295,7 +345,13 @@ if __name__ == '__main__':
                         help='task id list')  
     parser.add_argument('--num_train_epochs', default=40, type=int,
                         help='total number of training epochs')  
-    parser.add_argument('--local_rank', default=-1, type=int,
-                        help='whether to use distributed training')
+    parser.add_argument('--local_rank', '--local-rank', dest='local_rank',
+                        default=-1, type=int,
+                        help='whether to use distributed training '
+                             '(also read from the LOCAL_RANK env var set by torchrun)')
+    parser.add_argument('--num_workers', default=-1, type=int,
+                        help='override cfg["num_workers"] (-1: keep config value)')
+    parser.add_argument('--batch_size', default=-1, type=int,
+                        help='override the per-task batch size (-1: keep config value)')
     args = parser.parse_args()
     main(args)
