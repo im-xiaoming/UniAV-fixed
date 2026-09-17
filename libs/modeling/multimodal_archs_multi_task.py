@@ -342,8 +342,10 @@ class PtTransformer(nn.Module):
             # generate segment/lable List[N x 2] / List[N] with length = B
             assert video_list[0]['segments'] is not None, "GT action labels does not exist"
             assert video_list[0]['labels'] is not None, "GT action labels does not exist"
-            gt_offsets = [x['gt_offsets'] for x in video_list]
-            gt_cls_labels = [x['gt_cls_labels'] for x in video_list]
+            # DDP scatters inputs onto the GPU for us; without DDP they stay on the
+            # CPU and would clash with the model outputs (.to() is a no-op otherwise)
+            gt_offsets = [x['gt_offsets'].to(self.device) for x in video_list]
+            gt_cls_labels = [x['gt_cls_labels'].to(self.device) for x in video_list]
 
             # compute the loss and return
             losses = self.losses(
@@ -487,7 +489,8 @@ class PtTransformer(nn.Module):
         vid_lens = [x['duration'] for x in video_list]
         vid_ft_stride = [x['feat_stride'] for x in video_list]
         vid_ft_nframes = [x['feat_num_frames'] for x in video_list]
-        vid_points = [x['points'] for x in video_list]  
+        # see the note in forward(): the points come off the dataloader on the CPU
+        vid_points = [[p.to(self.device) for p in x['points']] for x in video_list]
 
         # 2: inference on each single video and gather the results
         # upto this point, all results use timestamps defined on feature grids

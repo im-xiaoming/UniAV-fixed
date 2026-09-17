@@ -150,10 +150,12 @@ def main(args):
         print("=> loading checkpoint '{}'".format(ckpt_file))
     # load ckpt, reset epoch / best rmse
     checkpoint = torch_load(ckpt_file, map_location=device)
-    # load ema model instead
+    # the EMA weights are the default (as in the original code); `--weights raw` loads the
+    # plain weights, which is what train.py evaluates after every epoch
+    key = 'state_dict_ema' if args.weights == 'ema' else 'state_dict'
     if default_gpu:
-        print("Loading from EMA model ...")
-    state_dict = checkpoint.get('state_dict_ema', checkpoint.get('state_dict'))
+        print("Loading weights from '{}' ...".format(key))
+    state_dict = checkpoint[key]
     model.load_state_dict(match_ckpt_prefix(state_dict, model))
     del checkpoint, state_dict
 
@@ -198,6 +200,8 @@ if __name__ == '__main__':
                         default=-1, type=int,
                         help='whether to use distributed testing '
                              '(also read from the LOCAL_RANK env var set by torchrun)')
+    parser.add_argument('--weights', default='ema', choices=['ema', 'raw'],
+                        help='evaluate the EMA weights (default) or the raw model weights')
     parser.add_argument('--num_workers', default=-1, type=int,
                         help='override cfg["num_workers"] (-1: keep config value)')
     parser.add_argument('--batch_size', default=-1, type=int,
