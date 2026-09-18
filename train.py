@@ -192,12 +192,44 @@ def main(args):
     # schedule
     scheduler = make_scheduler(optimizer, cfg['opt'], median_num_iter, args.num_train_epochs)
 
-    # enable model EMA
+    # fine-tune: start from the weights of a trained model (e.g. the released UniAV
+    # checkpoint), but with a fresh epoch counter / optimizer / scheduler, unlike --resume
+    if args.finetune:
+        if not os.path.isfile(args.finetune):
+            print("=> no checkpoint found at '{}'".format(args.finetune))
+            return
+        checkpoint = torch_load(args.finetune, map_location=device)
+        key = args.finetune_weights if args.finetune_weights in checkpoint else 'state_dict'
+        state_dict = checkpoint.get(key, checkpoint)
+        model.load_state_dict(match_ckpt_prefix(state_dict, model))
+        if default_gpu:
+            logger.info("=> fine-tuning from '{}' ({})".format(
+                args.finetune, key if key in checkpoint else 'raw state dict'))
+        del checkpoint, state_dict
+
+    # enable model EMA (created after fine-tune loading so it starts from the same weights)
     if default_gpu:
         logger.info("Using model EMA ...")
     model_ema = ModelEma(model)
 
     """4. Resume from model / Misc"""
+    # best val mAP per task so far; stored in every checkpoint so that a resumed run
+    # does not overwrite best.pth.tar with a worse model
+    best_mAP = {task_id: 0.0 for task_id in task_ids}
+    stop_fields = ('best', 'num_bad_epochs', 'cooldown_counter', 'in_stop', 'last_epoch')
+
+    def training_state(epoch):
+        return {
+            'epoch': epoch,
+            'state_dict': model.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'state_dict_ema': model_ema.module.state_dict(),
+            'best_mAP': dict(best_mAP),
+            'stop_state': {t: {f: getattr(c, f) for f in stop_fields}
+                           for t, c in task_stop_controller.items()},
+        }
+
     # resume from a checkpoint?
     if args.resume:
         if os.path.isfile(args.resume):
@@ -211,9 +243,22 @@ def main(args):
             # also load the optimizer / scheduler if necessary
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint['scheduler'])
-            print("=> loaded checkpoint '{:s}' (epoch {:d}".format(
+            # checkpoints written before this was added carry no best_mAP / stop_state
+            for task_id, value in checkpoint.get('best_mAP', {}).items():
+                if task_id in best_mAP:
+                    best_mAP[task_id] = value
+            for task_id, state in checkpoint.get('stop_state', {}).items():
+                if task_id in task_stop_controller:
+                    for field, value in state.items():
+                        setattr(task_stop_controller[task_id], field, value)
+            print("=> loaded checkpoint '{:s}' (epoch {:d})".format(
                 args.resume, checkpoint['epoch']
             ))
+            if 'best_mAP' in checkpoint:
+                print("=> best mAP so far: {}".format(best_mAP))
+            else:
+                print("=> checkpoint has no best mAP, the next evaluation will "
+                      "overwrite best.pth.tar")
             del checkpoint
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
@@ -230,7 +275,6 @@ def main(args):
 
 
     max_epochs = args.num_train_epochs + cfg['opt']['warmup_epochs']
-    best_mAP = {task_id: 0.0 for task_id in task_ids}
 
     for epoch in range(args.start_epoch, max_epochs):
         train_one_epoch_multitask(
@@ -282,13 +326,7 @@ def main(args):
                         best_mAP[task_id] = avg_mAP[task_id]
                     if improved:
                         save_checkpoint(
-                            {
-                                'epoch': epoch,
-                                'state_dict': model.state_dict(),
-                                'scheduler': scheduler.state_dict(),
-                                'optimizer': optimizer.state_dict(),
-                                'state_dict_ema': model_ema.module.state_dict(),
-                            },
+                            training_state(epoch),
                             None, False,
                             file_folder=ckpt_folder,
                             file_name='best.pth.tar'
@@ -306,16 +344,8 @@ def main(args):
                     (epoch > 0)
                 )
             ):
-                save_states = {
-                    'epoch': epoch,
-                    'state_dict': model.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                }
-
-                save_states['state_dict_ema'] = model_ema.module.state_dict()
                 save_checkpoint(
-                    save_states, None,
+                    training_state(epoch), None,
                     False,
                     file_folder=ckpt_folder,
                     file_name='epoch_{:03d}.pth.tar'.format(epoch)
@@ -341,6 +371,12 @@ if __name__ == '__main__':
                         help='name of exp folder (default: none)')
     parser.add_argument('--resume', default='', type=str, metavar='PATH',
                         help='path to a checkpoint (default: none)')
+    parser.add_argument('--finetune', default='', type=str, metavar='PATH',
+                        help='initialise the model from a checkpoint (weights only; '
+                             'epoch / optimizer / scheduler start fresh)')
+    parser.add_argument('--finetune_weights', default='state_dict_ema',
+                        choices=['state_dict_ema', 'state_dict'],
+                        help='which weights of the --finetune checkpoint to load')
     parser.add_argument('--tasks', default='1', type=str,
                         help='task id list')  
     parser.add_argument('--num_train_epochs', default=40, type=int,
